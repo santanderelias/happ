@@ -1,10 +1,10 @@
 use crate::config::{self, AppConfig};
 use crate::file_system::{self, FileSystemEvent, FileSystemItem};
 use chrono::{DateTime, Local};
-use eframe::egui::{self, Align, Key, Layout, Margin, Sense, TextEdit, TextStyle, Rect};
+use eframe::egui::{self, Align, Key, Layout, Margin, Sense, TextEdit};
+use egui_extras::{Column, TableBuilder};
 use human_bytes::human_bytes;
 use std::collections::HashSet;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -60,12 +60,16 @@ pub struct FileManager {
     file_op_progress: f32,
     show_settings_dialog: bool,
     show_about_dialog: bool,
+    drag_start_pos: Option<egui::Pos2>,
+    drag_rect: Option<egui::Rect>,
+    context_menu_rect: Option<egui::Rect>,
 }
 
 impl FileManager {
     pub fn new(rx: Receiver<Vec<FileSystemItem>>, event_tx: Sender<FileSystemEvent>) -> Self {
         let config = config::load_config().unwrap_or_default();
-        let current_path = config.history.last().cloned().unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+        let current_path =
+            config.history.last().cloned().unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
 
         let mut fm = Self {
             items: Vec::new(),
@@ -100,6 +104,9 @@ impl FileManager {
             file_op_progress: 0.0,
             show_settings_dialog: false,
             show_about_dialog: false,
+            drag_start_pos: None,
+            drag_rect: None,
+            context_menu_rect: None,
         };
 
         fm.navigate_to(&current_path.clone());
@@ -230,7 +237,21 @@ impl FileManager {
         self.event_tx.send(FileSystemEvent::OpenTerminal(terminal_path.to_path_buf())).unwrap();
     }
 
+    fn is_dialog_open(&self) -> bool {
+        self.show_new_file_dialog
+            || self.show_new_folder_dialog
+            || self.show_delete_confirmation
+            || self.show_go_to_dialog
+            || self.show_properties_dialog
+            || self.show_settings_dialog
+            || self.show_about_dialog
+            || self.renaming_item.is_some()
+    }
+
     fn handle_key_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.is_dialog_open() {
+            return;
+        }
         ctx.input(|i| {
             if i.key_pressed(Key::Backspace) {
                 self.go_back();
@@ -436,7 +457,8 @@ impl FileManager {
                     }
                     ui.separator();
                     for fav in self.favorites.clone() {
-                        if ui.button(fav.display().to_string()).clicked() {
+                        let fav_name = fav.file_name().unwrap_or_default().to_str().unwrap_or_default();
+                        if ui.button(fav_name).clicked() {
                             self.navigate_to(&fav);
                             ui.close_menu();
                         }
@@ -513,7 +535,29 @@ impl FileManager {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             let available_rect = ui.available_rect_before_wrap();
-            let response = ui.interact(available_rect, egui::Id::new("file_list_background"), Sense::click());
+            let response = ui.interact(
+                available_rect,
+                egui::Id::new("file_list_background"),
+                Sense::click_and_drag(),
+            );
+
+            if response.drag_started() {
+                if !ui.ctx().input(|i| i.modifiers.ctrl) {
+                    self.selected_items.clear();
+                }
+                self.drag_start_pos = response.hover_pos();
+            }
+            if response.dragged() {
+                if let Some(start_pos) = self.drag_start_pos {
+                    let current_pos = response.hover_pos().unwrap_or(start_pos);
+                    self.drag_rect = Some(egui::Rect::from_two_pos(start_pos, current_pos));
+                }
+            }
+            if response.drag_released() {
+                self.drag_start_pos = None;
+                self.drag_rect = None;
+            }
+
             if response.clicked() {
                 self.selected_items.clear();
             }
@@ -522,31 +566,51 @@ impl FileManager {
                 self.context_menu_item = None;
             }
 
-            let text_style = TextStyle::Body;
-            let row_height = ui.text_style_height(&text_style);
-            let num_rows = filtered_items.len();
+            if let Some(rect) = self.drag_rect {
+                ui.painter().rect_filled(
+                    rect,
+                    egui::Rounding::none(),
+                    ui.style().visuals.selection.bg_fill.gamma_multiply(0.5),
+                );
+            }
 
-            egui::Grid::new("file_list_grid")
-                .num_columns(3)
+            let table = TableBuilder::new(ui)
                 .striped(true)
-                .show(ui, |ui| {
-                    // Header
-                    ui.label("Name");
-                    ui.label("Size");
-                    ui.label("Last Modified");
-                    ui.end_row();
+                .resizable(true)
+                .column(Column::initial(250.0).at_least(100.0))
+                .column(Column::initial(80.0).at_least(40.0))
+                .column(Column::initial(150.0).at_least(80.0))
+                .min_scrolled_height(0.0);
 
-                    for item in filtered_items {
+            table
+                .header(20.0, |mut header| {
+                    header.col(|ui| {
+                        ui.strong("Name");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Size");
+                    });
+                    header.col(|ui| {
+                        ui.strong("Last Modified");
+                    });
+                })
+                .body(|body| {
+                    body.rows(18.0, filtered_items.len(), |row_index, mut row| {
+                        let item = &filtered_items[row_index];
                         let is_selected = self.selected_items.contains(&item.path);
-                        let icon = if item.is_dir { "📁" } else { "📄" };
 
-                        let response = ui.add(
-                            egui::Label::new(format!("{} {}", icon, item.path.file_name().unwrap().to_str().unwrap()))
-                                .sense(Sense::click()),
-                        );
-                        ui.input(|i| {
-                            if response.clicked() {
-                                if !i.modifiers.ctrl {
+                        row.col(|ui| {
+                            let icon = if item.is_dir { "📁" } else { "📄" };
+                            let label = format!("{} {}", icon, item.path.file_name().unwrap().to_str().unwrap());
+                            let response =
+                                ui.add(egui::SelectableLabel::new(is_selected, label));
+
+                            if let Some(drag_rect) = self.drag_rect {
+                                if drag_rect.intersects(response.rect) {
+                                    self.selected_items.insert(item.path.clone());
+                                }
+                            } else if response.clicked() {
+                                if !ui.input(|i| i.modifiers.ctrl) {
                                     self.selected_items.clear();
                                 }
                                 if is_selected {
@@ -555,35 +619,37 @@ impl FileManager {
                                     self.selected_items.insert(item.path.clone());
                                 }
                             }
-                        });
+                            if response.double_clicked() {
+                                self.open_item(&item.path.clone());
+                            }
+                            if response.secondary_clicked() {
+                                self.context_menu_pos = Some(response.hover_pos().unwrap());
+                                self.context_menu_item = Some(item.clone());
+                            }
 
-                        if response.double_clicked() {
-                            self.open_item(&item.path.clone());
-                        }
-                        if response.secondary_clicked() {
-                            self.context_menu_pos = Some(response.hover_pos().unwrap());
-                            self.context_menu_item = Some(item.clone());
-                        }
-
-                        if let Some(renaming_path) = &self.renaming_item {
-                            if renaming_path == &item.path {
-                                if ui.add(TextEdit::singleline(&mut self.renaming_text)).lost_focus() {
-                                    self.rename_item();
+                            if let Some(renaming_path) = &self.renaming_item {
+                                if renaming_path == &item.path {
+                                    if ui.add(TextEdit::singleline(&mut self.renaming_text)).lost_focus() {
+                                        self.rename_item();
+                                    }
                                 }
                             }
-                        }
-
-                        ui.label(if item.is_dir {
-                            "".to_string()
-                        } else {
-                            human_bytes(item.size as f64)
                         });
 
-                        let modified_time = DateTime::<Local>::from(item.modified).format("%Y-%m-%d %H:%M:%S").to_string();
-                        ui.label(modified_time);
+                        row.col(|ui| {
+                            ui.label(if item.is_dir {
+                                "".to_string()
+                            } else {
+                                human_bytes(item.size as f64)
+                            });
+                        });
 
-                        ui.end_row();
-                    }
+                        row.col(|ui| {
+                            let modified_time =
+                                DateTime::<Local>::from(item.modified).format("%Y-%m-%d %H:%M:%S").to_string();
+                            ui.label(modified_time);
+                        });
+                    });
                 });
         });
     }
@@ -605,10 +671,10 @@ impl FileManager {
                     ui.text_edit_singleline(&mut self.new_file_name);
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("Create").clicked() {
+                    if ui.button("Create").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         self.create_file();
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                         self.show_new_file_dialog = false;
                         self.new_file_name.clear();
                     }
@@ -623,10 +689,10 @@ impl FileManager {
                     ui.text_edit_singleline(&mut self.new_folder_name);
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("Create").clicked() {
+                    if ui.button("Create").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         self.create_folder();
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                         self.show_new_folder_dialog = false;
                         self.new_folder_name.clear();
                     }
@@ -653,11 +719,11 @@ impl FileManager {
             egui::Window::new("Go To Path").collapsible(false).resizable(false).show(ctx, |ui| {
                 ui.text_edit_singleline(&mut self.go_to_path);
                 ui.horizontal(|ui| {
-                    if ui.button("Go").clicked() {
+                    if ui.button("Go").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         self.navigate_to(&PathBuf::from(&self.go_to_path));
                         self.show_go_to_dialog = false;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
                         self.show_go_to_dialog = false;
                     }
                 });
@@ -721,66 +787,68 @@ impl FileManager {
 
     fn draw_context_menu(&mut self, ctx: &egui::Context) {
         if let Some(pos) = self.context_menu_pos {
-            egui::Area::new("context_menu")
-                .fixed_pos(pos)
-                .show(ctx, |ui| {
-                    let frame = egui::Frame::menu(ui.style());
-                    frame.show(ui, |ui| {
-                        if let Some(item) = &self.context_menu_item.clone() {
-                            ui.label(item.path.file_name().unwrap().to_str().unwrap());
-                            ui.separator();
-                            if ui.button("Open").clicked() {
-                                self.open_item(&item.path);
-                                self.context_menu_pos = None;
-                            }
-                            if ui.button("Rename").clicked() {
-                                self.renaming_item = Some(item.path.clone());
-                                self.renaming_text =
-                                    item.path.file_name().unwrap().to_str().unwrap().to_string();
-                                self.context_menu_pos = None;
-                            }
-                            if ui.button("Delete").clicked() {
-                                self.item_to_delete = Some(item.path.clone());
-                                self.show_delete_confirmation = true;
-                                self.context_menu_pos = None;
-                            }
-                            if ui.button("Properties").clicked() {
-                                self.properties_item = Some(item.clone());
-                                self.show_properties_dialog = true;
-                                self.context_menu_pos = None;
-                            }
-                            ui.separator();
-                            if ui.button("Copy Path").clicked() {
-                                ctx.output_mut(|o| o.copied_text = item.path.to_str().unwrap().to_string());
-                                self.context_menu_pos = None;
-                            }
-                            if ui.button("Open in Terminal").clicked() {
-                                self.open_in_terminal(&item.path);
-                                self.context_menu_pos = None;
-                            }
-                        } else {
-                            if ui.button("New File").clicked() {
-                                self.show_new_file_dialog = true;
-                                self.context_menu_pos = None;
-                            }
-                            if ui.button("New Folder").clicked() {
-                                self.show_new_folder_dialog = true;
-                                self.context_menu_pos = None;
-                            }
-                            ui.separator();
-                            if ui.button("Paste").clicked() {
-                                self.paste();
-                                self.context_menu_pos = None;
-                            }
-                            ui.separator();
-                            let current_path = self.current_path.clone();
-                            if ui.button("Open in Terminal").clicked() {
-                                self.open_in_terminal(&current_path);
-                                self.context_menu_pos = None;
-                            }
+            let area = egui::Area::new("context_menu").fixed_pos(pos);
+            let area_response = area.show(ctx, |ui| {
+                let frame = egui::Frame::menu(ui.style());
+                frame.show(ui, |ui| {
+                    if let Some(item) = &self.context_menu_item.clone() {
+                        ui.label(item.path.file_name().unwrap().to_str().unwrap());
+                        ui.separator();
+                        if ui.button("Open").clicked() {
+                            self.open_item(&item.path);
+                            self.context_menu_pos = None;
                         }
-                    });
+                        if ui.button("Rename").clicked() {
+                            self.renaming_item = Some(item.path.clone());
+                            self.renaming_text =
+                                item.path.file_name().unwrap().to_str().unwrap().to_string();
+                            self.context_menu_pos = None;
+                        }
+                        if ui.button("Delete").clicked() {
+                            self.item_to_delete = Some(item.path.clone());
+                            self.show_delete_confirmation = true;
+                            self.context_menu_pos = None;
+                        }
+                        if ui.button("Properties").clicked() {
+                            self.properties_item = Some(item.clone());
+                            self.show_properties_dialog = true;
+                            self.context_menu_pos = None;
+                        }
+                        ui.separator();
+                        if ui.button("Copy Path").clicked() {
+                            ctx.output_mut(|o| o.copied_text = item.path.to_str().unwrap().to_string());
+                            self.context_menu_pos = None;
+                        }
+                        if ui.button("Open in Terminal").clicked() {
+                            self.open_in_terminal(&item.path);
+                            self.context_menu_pos = None;
+                        }
+                    } else {
+                        if ui.button("New File").clicked() {
+                            self.show_new_file_dialog = true;
+                            self.context_menu_pos = None;
+                        }
+                        if ui.button("New Folder").clicked() {
+                            self.show_new_folder_dialog = true;
+                            self.context_menu_pos = None;
+                        }
+                        ui.separator();
+                        if ui.button("Paste").clicked() {
+                            self.paste();
+                            self.context_menu_pos = None;
+                        }
+                        ui.separator();
+                        let current_path = self.current_path.clone();
+                        if ui.button("Open in Terminal").clicked() {
+                            self.open_in_terminal(&current_path);
+                            self.context_menu_pos = None;
+                        }
+                    }
                 });
+            });
+            self.context_menu_rect = Some(area_response.response.rect);
+        } else {
+            self.context_menu_rect = None;
         }
     }
 }
@@ -814,8 +882,14 @@ impl eframe::App for FileManager {
         self.draw_context_menu(ctx);
 
         ctx.input(|i| {
-            if i.pointer.any_click() && self.context_menu_pos.is_some() {
-                self.context_menu_pos = None;
+            if i.pointer.any_click() {
+                if let Some(menu_rect) = self.context_menu_rect {
+                    if let Some(pos) = i.pointer.hover_pos() {
+                        if !menu_rect.contains(pos) {
+                            self.context_menu_pos = None;
+                        }
+                    }
+                }
             }
         });
 
